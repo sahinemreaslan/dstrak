@@ -1,0 +1,49 @@
+# DSTARK Training Configuration
+
+# Model settings
+hidden_dim: 256
+
+# Template and Search sizes (flexible, can be adjusted during training)
+template_size: 128
+search_size: 256
+max_template_size: 256  # Maximum size for large objects
+max_search_size: 512    # Maximum size for large search regions
+
+# Loss weights
+bbox_loss_weight: 5.0
+giou_loss_weight: 2.0
+conf_loss_weight: 1.0
+
+# Optimizer settings
+backbone_lr: 1.0e-5     # Lower learning rate for pretrained backbone
+head_lr: 1.0e-4         # Higher learning rate for tracking head
+weight_decay: 1.0e-4
+
+# Learning rate scheduler
+scheduler_type: 'cosine'  # Options: 'cosine', 'multistep'
+min_lr: 1.0e-7
+
+# For multistep scheduler
+milestones: [150, 250]
+gamma: 0.1
+
+# Training settings
+epochs: 300
+batch_size: 16
+num_workers: 4
+
+# Data augmentation
+scale_jitter: true
+center_jitter: true
+color_jitter: true
+
+# Dataset
+dataset_name: 'GOT10k'
+data_root: 'data/GOT10k'
+
+# Key advantages of DSTARK:
+# 1. No fixed 128/256 template/search constraints
+# 2. DINOv3 RoPE allows flexible input sizes
+# 3. Better occlusion handling with rich DINOv3 features
+# 4. Adaptive sizing based on object scale
+# 5. Can track varying object sizes throughout video

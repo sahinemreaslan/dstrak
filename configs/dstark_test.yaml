@@ -1,0 +1,16 @@
+# DSTARK Testing Configuration
+
+# Model settings
+hidden_dim: 256
+
+# Template and Search sizes for inference
+template_size: 128
+search_size: 256
+
+# Test settings
+benchmark: 'GOT10k'  # Options: 'GOT10k', 'OTB', 'LaSOT', 'TrackingNet'
+visualize: false
+save_results: true
+
+# GPU settings
+gpu: '0'
