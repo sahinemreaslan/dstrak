@@ -3,6 +3,11 @@ DSTARK Tracker Head
 
 Main tracking model that combines DINOv3 backbone with correlation-based tracking.
 Supports flexible template and search sizes without hardcoded constraints.
+
+Design Patterns:
+- Strategy Pattern: Interchangeable backbone and head components
+- Dependency Injection: Components injected rather than created internally
+- Facade Pattern: Simple interface hiding complex tracking logic
 """
 
 import torch
@@ -10,14 +15,33 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
 
+from .base_head import CorrelationBasedHead
+from .base_backbone import BaseBackbone
 
-class CorrelationHead(nn.Module):
-    """Correlation-based tracking head"""
 
-    def __init__(self, feat_dim=384, hidden_dim=256):
-        super().__init__()
+class CorrelationHead(CorrelationBasedHead):
+    """
+    Correlation-based tracking head implementation.
 
-        self.feat_dim = feat_dim
+    Implements the CorrelationBasedHead interface with specific
+    dot-product based correlation computation.
+
+    Architecture:
+    1. Project template & search features to hidden_dim
+    2. Compute dot-product correlation
+    3. Weight search features by correlation
+    4. Predict bbox and confidence via CNN heads
+    """
+
+    def __init__(self, feat_dim: int = 384, hidden_dim: int = 256):
+        """
+        Initialize correlation head.
+
+        Args:
+            feat_dim: Input feature dimension from backbone
+            hidden_dim: Hidden dimension for processing
+        """
+        super().__init__(feat_dim, hidden_dim)
 
         # Feature adjustment layers
         self.template_proj = nn.Sequential(
@@ -56,37 +80,31 @@ class CorrelationHead(nn.Module):
             nn.Conv2d(64, 1, kernel_size=1)  # confidence score
         )
 
-    def forward(self, template_feat, search_feat):
+    def compute_correlation(
+        self,
+        template_feat: torch.Tensor,
+        search_feat: torch.Tensor
+    ) -> torch.Tensor:
         """
+        Compute correlation map between template and search features.
+
+        Uses dot-product similarity with L2 normalization.
+
         Args:
-            template_feat: [B, N_template, C] - Template features (flexible size)
-            search_feat: [B, N_search, C] - Search features (flexible size)
+            template_feat: Template features [B, N_template, feat_dim]
+            search_feat: Search features [B, N_search, feat_dim]
 
         Returns:
-            pred_boxes: Predicted bounding boxes
-            pred_conf: Confidence scores
+            correlation_map: Correlation map [B, 1, H, W]
         """
-        B = template_feat.shape[0]
-
-        # Project features
-        template_feat = self.template_proj(template_feat)  # [B, N_t, hidden_dim]
-        search_feat = self.search_proj(search_feat)  # [B, N_s, hidden_dim]
-
-        # Compute correlation (using dot product)
-        # Remove CLS token for spatial correlation
-        template_tokens = template_feat[:, 1:, :]  # Remove CLS
-        search_tokens = search_feat[:, 1:, :]  # Remove CLS
-
-        # Calculate spatial dimensions dynamically
-        N_t = template_tokens.shape[1]
-        N_s = search_tokens.shape[1]
-        h_s = w_s = int(N_s ** 0.5)  # Assume square for simplicity
+        # Remove CLS tokens
+        template_tokens = template_feat[:, 1:, :]
+        search_tokens = search_feat[:, 1:, :]
 
         # Normalize for stable correlation
         template_tokens = F.normalize(template_tokens, dim=-1)
         search_tokens = F.normalize(search_tokens, dim=-1)
 
-        # Correlation via matrix multiplication
         # Average template tokens to create a prototype
         template_proto = template_tokens.mean(dim=1, keepdim=True)  # [B, 1, C]
 
@@ -95,9 +113,42 @@ class CorrelationHead(nn.Module):
         correlation = correlation.squeeze(-1)  # [B, N_s]
 
         # Reshape to spatial
-        correlation_map = correlation.view(B, 1, h_s, w_s)
+        N_s = search_tokens.shape[1]
+        h_s = w_s = int(N_s ** 0.5)
+        correlation_map = correlation.view(-1, 1, h_s, w_s)
+
+        return correlation_map
+
+    def forward(
+        self,
+        template_feat: torch.Tensor,
+        search_feat: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict bounding box and confidence from features.
+
+        Args:
+            template_feat: Template features [B, N_template, feat_dim]
+            search_feat: Search features [B, N_search, feat_dim]
+
+        Returns:
+            pred_boxes: Predicted bounding boxes [B, 4, H, W]
+            pred_conf: Confidence scores [B, 1, H, W]
+        """
+        # Project features to hidden dimension
+        template_feat_proj = self.template_proj(template_feat)  # [B, N_t, hidden_dim]
+        search_feat_proj = self.search_proj(search_feat)  # [B, N_s, hidden_dim]
+
+        # Compute correlation map
+        correlation_map = self.compute_correlation(template_feat_proj, search_feat_proj)
+
+        # Get search tokens without CLS
+        search_tokens = search_feat_proj[:, 1:, :]  # [B, N_s, hidden_dim]
+        N_s = search_tokens.shape[1]
+        h_s = w_s = int(N_s ** 0.5)
 
         # Expand search features to 2D for conv processing
+        B = search_tokens.shape[0]
         search_2d = search_tokens.transpose(1, 2).view(B, -1, h_s, w_s)
 
         # Weighted search features
@@ -115,45 +166,39 @@ class CorrelationHead(nn.Module):
 
 class DSTARKTracker(nn.Module):
     """
-    Complete DSTARK Tracker
+    Complete DSTARK Tracker.
+
+    Combines a flexible backbone with a tracking head for visual object tracking.
 
     Key improvements over standard STARK:
-    - No fixed template/search size (uses DINOv3 RoPE)
-    - Better feature extraction with DINOv3
-    - Handles occlusion better with rich features
-    - Can track varying object sizes
+    - No fixed template/search size (uses flexible position encoding)
+    - Better feature extraction with DINOv3 self-supervised pretraining
+    - Handles occlusion better with rich semantic features
+    - Can track objects at varying scales
+
+    Design Patterns:
+    - Dependency Injection: Backbone and head are injected
+    - Facade: Provides simple interface for complex tracking
+    - Strategy: Components can be swapped without changing interface
     """
 
     def __init__(
         self,
-        backbone_config: Optional[Dict] = None,
-        hidden_dim: int = 256,
-        pretrained_path: Optional[str] = None,
+        backbone: BaseBackbone,
+        head: CorrelationHead,
     ):
+        """
+        Initialize DSTARK tracker with dependency injection.
+
+        Args:
+            backbone: Feature extraction backbone (e.g., DINOv3Backbone)
+            head: Tracking head (e.g., CorrelationHead)
+        """
         super().__init__()
 
-        # Import here to avoid circular dependency
-        from .dinov3_backbone import DINOv3Backbone
-
-        # Default backbone config for DINOv3 Small
-        if backbone_config is None:
-            backbone_config = {
-                'img_size': 224,
-                'patch_size': 16,
-                'embed_dim': 384,
-                'depth': 12,
-                'num_heads': 6,
-                'pretrained_path': pretrained_path
-            }
-
-        # Backbone
-        self.backbone = DINOv3Backbone(**backbone_config)
-        feat_dim = backbone_config.get('embed_dim', 384)
-
-        # Tracking head
-        self.head = CorrelationHead(feat_dim=feat_dim, hidden_dim=hidden_dim)
-
-        self.feat_dim = feat_dim
+        self.backbone = backbone
+        self.head = head
+        self.feat_dim = backbone.embed_dim
 
     def forward(
         self,
@@ -162,7 +207,7 @@ class DSTARKTracker(nn.Module):
         return_features: bool = False
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass
+        Forward pass for training or offline tracking.
 
         Args:
             template: Template image [B, 3, H_t, W_t] - flexible size!
@@ -170,7 +215,11 @@ class DSTARKTracker(nn.Module):
             return_features: Whether to return intermediate features
 
         Returns:
-            Dictionary containing predictions
+            Dictionary containing:
+                - pred_boxes: Predicted bounding boxes [B, 4, H, W]
+                - pred_conf: Confidence scores [B, 1, H, W]
+                - template_feat: (optional) Template features
+                - search_feat: (optional) Search features
         """
         # Extract features with flexible sizes
         template_feat = self.backbone(template)  # [B, N_t+1, C]
@@ -191,7 +240,19 @@ class DSTARKTracker(nn.Module):
         return output
 
     def template(self, z: torch.Tensor) -> torch.Tensor:
-        """Extract template features (for online tracking)"""
+        """
+        Extract template features (for online tracking).
+
+        This should be called once per tracked object to extract
+        and cache template features. Subsequently use track() for
+        efficient inference.
+
+        Args:
+            z: Template image [B, 3, H, W]
+
+        Returns:
+            Template features [B, N+1, C]
+        """
         return self.backbone(z)
 
     def track(
@@ -200,14 +261,18 @@ class DSTARKTracker(nn.Module):
         search: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """
-        Track with pre-extracted template features
+        Track with pre-extracted template features (online tracking).
+
+        More efficient than forward() as template features are reused.
 
         Args:
             template_feat: Pre-extracted template features [B, N_t+1, C]
             search: Search image [B, 3, H, W]
 
         Returns:
-            Tracking predictions
+            Dictionary containing:
+                - pred_boxes: Predicted bounding boxes [B, 4, H, W]
+                - pred_conf: Confidence scores [B, 1, H, W]
         """
         search_feat = self.backbone(search)
         pred_boxes, pred_conf = self.head(template_feat, search_feat)
@@ -217,16 +282,21 @@ class DSTARKTracker(nn.Module):
             'pred_conf': pred_conf,
         }
 
-    def get_box_and_score(self, predictions: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, float]:
+    def get_box_and_score(
+        self,
+        predictions: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Extract final box and confidence from predictions
+        Extract final box and confidence from predictions.
+
+        Selects the bounding box at the location with highest confidence.
 
         Args:
-            predictions: Model output dictionary
+            predictions: Model output dictionary containing pred_boxes and pred_conf
 
         Returns:
-            bbox: [x, y, w, h] in original image coordinates
-            score: Confidence score
+            final_boxes: Bounding boxes [B, 4] (cx, cy, w, h)
+            scores: Confidence scores [B]
         """
         pred_boxes = predictions['pred_boxes']  # [B, 4, H, W]
         pred_conf = predictions['pred_conf']  # [B, 1, H, W]
@@ -256,12 +326,41 @@ class DSTARKTracker(nn.Module):
 
 
 def build_dstark(config: Dict) -> DSTARKTracker:
-    """Build DSTARK model from config"""
+    """
+    Build DSTARK model from dictionary config (legacy support).
 
-    model = DSTARKTracker(
-        backbone_config=config.get('backbone', None),
-        hidden_dim=config.get('hidden_dim', 256),
-        pretrained_path=config.get('pretrained_path', None)
-    )
+    DEPRECATED: Use ModelFactory.create_tracker() for better type safety.
+
+    Args:
+        config: Dictionary containing model configuration
+
+    Returns:
+        Initialized DSTARKTracker
+    """
+    from .dinov3_backbone import DINOv3Backbone
+
+    # Extract backbone config
+    backbone_config = config.get('backbone', {})
+    if 'pretrained_path' not in backbone_config:
+        backbone_config['pretrained_path'] = config.get('pretrained_path', None)
+
+    # Default to DINOv3 Small if no config provided
+    if not backbone_config:
+        backbone_config = {
+            'img_size': 224,
+            'patch_size': 16,
+            'embed_dim': 384,
+            'depth': 12,
+            'num_heads': 6,
+        }
+
+    # Build components
+    backbone = DINOv3Backbone(**backbone_config)
+    feat_dim = backbone_config.get('embed_dim', 384)
+    hidden_dim = config.get('hidden_dim', 256)
+    head = CorrelationHead(feat_dim=feat_dim, hidden_dim=hidden_dim)
+
+    # Build tracker
+    model = DSTARKTracker(backbone=backbone, head=head)
 
     return model

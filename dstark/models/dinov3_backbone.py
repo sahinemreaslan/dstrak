@@ -1,6 +1,12 @@
 """
 DINOv3 Backbone for DSTARK
-Supports flexible input sizes thanks to RoPE (Rotary Position Embeddings)
+
+Supports flexible input sizes thanks to RoPE (Rotary Position Embeddings).
+Implements the FlexibleBackbone interface for loose coupling with tracker.
+
+Design Pattern: Strategy Pattern
+- Implements abstract backbone interface
+- Can be swapped with other backbones without changing tracker code
 """
 
 import torch
@@ -8,6 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 import math
+
+from .base_backbone import FlexibleBackbone
 
 
 class Attention(nn.Module):
@@ -78,34 +86,58 @@ class Block(nn.Module):
         return x
 
 
-class DINOv3Backbone(nn.Module):
+class DINOv3Backbone(FlexibleBackbone):
     """
-    DINOv3 Small backbone for visual tracking
+    DINOv3 Small backbone for visual tracking.
+
+    Implements FlexibleBackbone interface for compatibility with DSTARK tracker.
 
     Key features:
-    - Flexible input sizes thanks to RoPE
+    - Flexible input sizes thanks to interpolated positional encodings
     - No fixed template/search size constraints
-    - Rich feature extraction at multiple scales
+    - Rich feature extraction with self-supervised pretrained weights
+    - Supports RoPE (Rotary Position Embeddings) style interpolation
+
+    Architecture:
+    - Patch-based Vision Transformer
+    - Default: DINOv3-Small (384-dim, 12 layers, 6 heads)
+    - Can be configured for Base/Large variants
     """
 
     def __init__(
         self,
-        img_size=224,
-        patch_size=16,
-        in_chans=3,
-        embed_dim=384,  # DINOv3 small
-        depth=12,
-        num_heads=6,
-        mlp_ratio=4.,
-        qkv_bias=True,
-        drop_rate=0.,
-        attn_drop_rate=0.,
-        pretrained_path=None
+        img_size: int = 224,
+        patch_size: int = 16,
+        in_chans: int = 3,
+        embed_dim: int = 384,  # DINOv3 small
+        depth: int = 12,
+        num_heads: int = 6,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        drop_rate: float = 0.0,
+        attn_drop_rate: float = 0.0,
+        pretrained_path: Optional[str] = None
     ):
+        """
+        Initialize DINOv3 backbone.
+
+        Args:
+            img_size: Default image size (for pos_embed initialization)
+            patch_size: Patch size for patch embedding
+            in_chans: Number of input channels
+            embed_dim: Embedding dimension
+            depth: Number of transformer blocks
+            num_heads: Number of attention heads
+            mlp_ratio: MLP hidden dim ratio
+            qkv_bias: Use bias in QKV projection
+            drop_rate: Dropout rate
+            attn_drop_rate: Attention dropout rate
+            pretrained_path: Path to pretrained weights
+        """
         super().__init__()
 
-        self.patch_size = patch_size
-        self.embed_dim = embed_dim
+        self._patch_size = patch_size
+        self._embed_dim = embed_dim
         self.num_patches = (img_size // patch_size) ** 2
 
         # Patch embedding
@@ -139,8 +171,18 @@ class DINOv3Backbone(nn.Module):
         self.apply(self._init_weights)
 
         # Load pretrained weights if provided
-        if pretrained_path:
+        if pretrained_path is not None:
             self.load_pretrained(pretrained_path)
+
+    @property
+    def embed_dim(self) -> int:
+        """Return the embedding dimension (implements BaseBackbone interface)."""
+        return self._embed_dim
+
+    @property
+    def patch_size(self) -> int:
+        """Return the patch size (implements BaseBackbone interface)."""
+        return self._patch_size
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -151,8 +193,27 @@ class DINOv3Backbone(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def interpolate_pos_encoding(self, x, w, h):
-        """Interpolate positional embeddings for arbitrary input sizes"""
+    def interpolate_pos_encoding(
+        self,
+        x: torch.Tensor,
+        w: int,
+        h: int
+    ) -> torch.Tensor:
+        """
+        Interpolate positional embeddings for arbitrary input sizes.
+
+        This allows the model to handle images of any size, not just
+        the size it was pretrained on. Critical for tracking where
+        template and search regions have different sizes.
+
+        Args:
+            x: Feature tensor [B, N+1, C] (includes CLS token)
+            w: Width of input image
+            h: Height of input image
+
+        Returns:
+            Interpolated positional embeddings [B, N+1, C]
+        """
         npatch = x.shape[1] - 1
         N = self.pos_embed.shape[1] - 1
 
@@ -212,8 +273,16 @@ class DINOv3Backbone(nn.Module):
 
         return x
 
-    def load_pretrained(self, pretrained_path):
-        """Load pretrained weights"""
+    def load_pretrained(self, pretrained_path: str) -> None:
+        """
+        Load pretrained weights (implements BaseBackbone interface).
+
+        Handles different checkpoint formats gracefully and allows
+        size mismatches for positional embeddings (which will be interpolated).
+
+        Args:
+            pretrained_path: Path to pretrained weights file
+        """
         print(f"Loading pretrained weights from {pretrained_path}")
 
         checkpoint = torch.load(pretrained_path, map_location='cpu')
@@ -233,9 +302,47 @@ class DINOv3Backbone(nn.Module):
         msg = self.load_state_dict(state_dict, strict=False)
         print(f"Loaded pretrained weights: {msg}")
 
-    def get_num_layers(self):
+    def get_num_layers(self) -> int:
+        """Return the number of transformer layers."""
         return len(self.blocks)
 
     @torch.jit.ignore
     def no_weight_decay(self):
+        """Return parameters that should not have weight decay applied."""
         return {'pos_embed', 'cls_token'}
+
+    def freeze_except_last_n_layers(self, n: int) -> None:
+        """
+        Freeze all layers except the last n transformer blocks.
+
+        Useful for fine-tuning with limited data.
+
+        Args:
+            n: Number of last blocks to keep trainable
+        """
+        # Freeze patch embedding
+        for param in self.patch_embed.parameters():
+            param.requires_grad = False
+
+        # Freeze position embeddings and cls token
+        self.pos_embed.requires_grad = False
+        self.cls_token.requires_grad = False
+
+        # Freeze all blocks except last n
+        num_blocks = len(self.blocks)
+        freeze_until = max(0, num_blocks - n)
+
+        for i, block in enumerate(self.blocks):
+            if i < freeze_until:
+                for param in block.parameters():
+                    param.requires_grad = False
+            else:
+                for param in block.parameters():
+                    param.requires_grad = True
+
+        # Keep final norm trainable if any blocks are trainable
+        if n > 0:
+            for param in self.norm.parameters():
+                param.requires_grad = True
+
+        print(f"Froze all layers except last {n} transformer blocks")
